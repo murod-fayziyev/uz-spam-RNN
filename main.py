@@ -4,9 +4,18 @@ import pickle
 import torch
 import torch.nn as nn
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI(title="Uzbek Cyber Threat & Spam Detection API", version="2.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Barcha manbalarga, shu jumladan github.io ga to'liq ruxsat
+    allow_credentials=True,
+    allow_methods=["*"],  # GET, POST, OPTIONS kabi barcha so'rovlar uchun
+    allow_headers=["*"],  # Barcha sarlavhalar (Content-Type va hk.) uchun
+)
 
 DEVICE = torch.device("cpu")
 MODEL_PATH = "best_model.pth"
