@@ -1,174 +1,318 @@
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import torch
+import torch.nn as nn
 import os
 import re
 import pickle
-import torch
-import torch.nn as nn
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import hashlib
+import httpx
+from typing import Optional
 
-app = FastAPI(title="Uzbek Cyber Threat & Spam Detection API", version="2.0")
+# =====================================================================
+# 1. KONFIGURATSIYA VA SUPABASE SOZLAMALARI
+# =====================================================================
+SUPABASE_URL = "https://hmmdrxeotfjscwudsyhb.supabase.co"
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation"
+}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Barcha manbalarga, shu jumladan github.io ga to'liq ruxsat
-    allow_credentials=True,
-    allow_methods=["*"],  # GET, POST, OPTIONS kabi barcha so'rovlar uchun
-    allow_headers=["*"],  # Barcha sarlavhalar (Content-Type va hk.) uchun
+app = FastAPI(
+    title="Uzbek Cyber Threat & SOC Intelligence API",
+    version="3.0",
+    description="Bi-LSTM Attention Engine + Supabase Threat Vault Integratsiyasi"
 )
 
-DEVICE = torch.device("cpu")
-MODEL_PATH = "best_model.pth"
-VOCAB_PATH = "vocab_pro.pkl"
-MAX_LEN = 60
+# CORS sozlamalari (GitHub Pages ruxsati)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- 1. MODEL ARXITEKTURASI ---
-class SelfAttention(nn.Module):
+# =====================================================================
+# 2. MODEL ARXITEKTURASI (Bi-LSTM + Self-Attention)
+# =====================================================================
+class Attention(nn.Module):
     def __init__(self, hidden_dim):
-        super(SelfAttention, self).__init__()
-        self.projection = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 1)
-        )
+        super(Attention, self).__init__()
+        self.attn = nn.Linear(hidden_dim * 2, 1)
 
-    def forward(self, encoder_outputs):
-        energy = self.projection(encoder_outputs)
-        weights = torch.softmax(energy, dim=1)
-        context = torch.sum(weights * encoder_outputs, dim=1)
-        return context, weights
+    def forward(self, lstm_output):
+        # lstm_output: (batch_size, seq_len, hidden_dim * 2)
+        scores = self.attn(lstm_output).squeeze(2)  # (batch_size, seq_len)
+        weights = torch.softmax(scores, dim=1).unsqueeze(2)  # (batch_size, seq_len, 1)
+        context = torch.sum(lstm_output * weights, dim=1)  # (batch_size, hidden_dim * 2)
+        return context
 
-class RobustCyberBiLSTM(nn.Module):
-    def __init__(self, vocab_size, embed_dim=128, hidden_dim=128, num_layers=2, dropout=0.35):
-        super(RobustCyberBiLSTM, self).__init__()
+class BiLSTMClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim=64, hidden_dim=64, num_layers=1):
+        super(BiLSTMClassifier, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
         self.lstm = nn.LSTM(
             embed_dim, 
             hidden_dim, 
             num_layers=num_layers, 
-            bidirectional=True, 
             batch_first=True, 
-            dropout=dropout if num_layers > 1 else 0
+            bidirectional=True
         )
-        self.attention = SelfAttention(hidden_dim * 2)
-        self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_dim * 2, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 1)
-        )
+        self.attention = Attention(hidden_dim)
+        self.fc = nn.Linear(hidden_dim * 2, 1)
 
     def forward(self, x):
-        embedded = self.dropout(self.embedding(x))
+        embedded = self.embedding(x)
         lstm_out, _ = self.lstm(embedded)
-        context, attn_weights = self.attention(lstm_out)
-        out = self.fc(context)
-        return out.squeeze(1), attn_weights
+        attn_out = self.attention(lstm_out)
+        out = self.fc(attn_out)
+        return torch.sigmoid(out)
 
-# --- 2. LUG'AT VA MODELNI YUKLASH ---
-if not os.path.exists(VOCAB_PATH) or not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError("best_model.pth yoki vocab_pro.pkl topilmadi!")
+# =====================================================================
+# 3. MODEL VA LUG'ATNI XOTIRAGA YUKLASH
+# =====================================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = None
+vocab = None
+MAX_LEN = 100
 
-with open(VOCAB_PATH, "rb") as f:
-    vocab = pickle.load(f)
+def load_ai_engine():
+    global model, vocab
+    vocab_path = "vocab_pro.pkl"
+    model_path = "best_spam_bilstm_pro.pt"
+    if not os.path.exists(model_path):
+        model_path = "best_model.pth"
 
-model = RobustCyberBiLSTM(vocab_size=len(vocab)).to(DEVICE)
-# MUHIM: Render CPU'da ishlashi uchun map_location='cpu'
-model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-model.eval()
+    try:
+        if os.path.exists(vocab_path):
+            with open(vocab_path, "rb") as f:
+                vocab = pickle.load(f)
+            print(" [OK] Lug'at (vocab) muvaffaqiyatli yuklandi.")
 
-# --- 3. TOKENIZATOR VA GIBRID FILTR ---
-def tokenize_cyber(text):
-    text = str(text).lower()
-    text = re.sub(r'\b(8600|9860|5614|6262)[\d\s\*]{8,22}', ' <card> ', text)
-    text = re.sub(r'\b[\w\-]+\.apk\b', ' <apk> ', text)
-    text = re.sub(r'(\+?998[\s\-]?[0-9]{2}[\s\-]?[0-9]{3}[\s\-]?[0-9]{2}[\s\-]?[0-9]{2})', ' <phone> ', text)
-    text = re.sub(r'https?://\S+|www\.\S+|\b\S+\.(?:top|xyz|link|site|biz|ru|com|uz|info|online)\b\/?\S*', ' <url> ', text)
-    text = re.sub(r'\b\d+[\d\s.,]*\b', ' <num> ', text)
-    return re.findall(r'<card>|<url>|<apk>|<phone>|<num>|[\w\']+', text)
+        if os.path.exists(model_path) and vocab:
+            model = BiLSTMClassifier(vocab_size=len(vocab))
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            model.to(device)
+            model.eval()
+            print(" [OK] Bi-LSTM neyron modeli yuklandi.")
+    except Exception as e:
+        print(f" [OGOHLANTIRISH] Model yuklashda xatolik: {e}")
 
-def text_to_sequence(text, vocab, max_len=MAX_LEN):
-    tokens = tokenize_cyber(text)
-    seq = [vocab.get(token, vocab.get('<unk>', 1)) for token in tokens]
-    if len(seq) < max_len:
-        seq = seq + [vocab.get('<pad>', 0)] * (max_len - len(seq))
-    else:
-        seq = seq[:max_len]
-    return seq
+load_ai_engine()
 
-TRUSTED_DOMAINS = [
-    'uzcard.uz', 'humocard.uz', 'payme.uz', 'click.uz', 'uzum.uz',
-    'kapitalbank.uz', 'nbu.uz', 'cbu.uz', 'anorbank.uz', 'tbcbank.uz',
-    'ipakyulibank.uz', 'agrobank.uz', 'xalqbanki.uz', 'hamkorbank.uz',
-    'gov.uz', 'my.gov.uz', 'lex.uz'
-]
+# =====================================================================
+# 4. KIBER-RAZVEDKA, PII NIQOBLASH VA IoC AJRATISH
+# =====================================================================
+
+def mask_personal_data(text: str) -> str:
+    """Karta va telefon kabi shaxsiy ma'lumotlarni qisman yopish"""
+    # Karta raqamlarini niqoblash: 8600 1234 5678 9012 -> 8600 12** **** 9012
+    masked = re.sub(
+        r'\b(8600|9860|5614|6262)[\s\-]?(\d{2})\d{2}[\s\-]?\d{4}[\s\-]?(\d{4})\b',
+        r'\1 \2** **** \3',
+        text
+    )
+    # Telefon raqamlarini niqoblash: +998 90 123 45 67 -> +998 90 *** ** 67
+    masked = re.sub(
+        r'(\+?998[\s\-]?[0-9]{2})[\s\-]?[0-9]{3}[\s\-]?[0-9]{2}([\s\-]?[0-9]{2})',
+        r'\1 *** ** \2',
+        masked
+    )
+    return masked
+
+def extract_threat_iocs(text: str):
+    """Matndan texnik IoC parametrlarini ajratib olish"""
+    lower = text.lower()
+    
+    # 1. Karta turi
+    card_type = None
+    if re.search(r'\b8600', text):
+        card_type = "Uzcard (8600)"
+    elif re.search(r'\b9860', text):
+        card_type = "Humo (9860)"
+    elif re.search(r'\b(5614|6262)', text):
+        card_type = "Xalqaro / Boshqa Karta"
+
+    # 2. Domen va domen zonasi
+    domain_info = None
+    url_match = re.search(r'https?://([^/\s]+)|www\.([^/\s]+)|\b([a-zA-Z0-9\.\-]+\.(?:top|xyz|link|site|biz|ru|com|uz|info|online))\b', text, re.I)
+    if url_match:
+        extracted = url_match.group(1) or url_match.group(2) or url_match.group(3)
+        domain_info = extracted.lower()
+
+    # 3. APK borligi
+    has_apk = bool(".apk" in lower)
+
+    return card_type, domain_info, has_apk
+
+def calculate_text_hash(text: str) -> str:
+    """Deduplication uchun xabar matnidan SHA-256 hesh olish"""
+    normalized = " ".join(text.lower().split())
+    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+
+# =====================================================================
+# 5. SUPABASE BILAN ISHLASH (ASYNCHRONOUS VAULT ENGINE)
+# =====================================================================
+
+async def save_or_increment_in_vault(clean_text: str, text_hash: str, prob: float, card_type: str, domain: str, has_apk: bool):
+    """Xabarni Supabase bazasiga kiritish yoki takrorlanish sonini oshirish"""
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            # 1. Hesh orqali bazada bor-yo'qligini tekshirish
+            check_url = f"{SUPABASE_URL}/rest/v1/threat_vault?text_hash=eq.{text_hash}&select=id,occurrence_count"
+            resp = await client.get(check_url, headers=SUPABASE_HEADERS)
+            
+            if resp.status_code == 200 and resp.json():
+                # Xabar allaqachon bor: occurrence_count ni +1 ga oshiramiz
+                row = resp.json()[0]
+                row_id = row["id"]
+                current_count = row.get("occurrence_count", 1) or 1
+                
+                patch_url = f"{SUPABASE_URL}/rest/v1/threat_vault?id=eq.{row_id}"
+                await client.patch(patch_url, headers=SUPABASE_HEADERS, json={"occurrence_count": current_count + 1})
+            else:
+                # Yangi xabar: 5-savat (inference_raw_logs) qilib yozamiz
+                insert_url = f"{SUPABASE_URL}/rest/v1/threat_vault"
+                payload = {
+                    "text_hash": text_hash,
+                    "clean_text": clean_text,
+                    "model_prob": prob,
+                    "user_reaction": "none",
+                    "basket_type": "inference_raw_logs",
+                    "ioc_card": card_type,
+                    "ioc_domain": domain,
+                    "ioc_has_apk": has_apk,
+                    "occurrence_count": 1
+                }
+                await client.post(insert_url, headers=SUPABASE_HEADERS, json=payload)
+    except Exception as e:
+        print(f" [SUPABASE XATOLIGI] Yozishda muammo: {e}")
+
+# =====================================================================
+# 6. API ENDPOINTLARI
+# =====================================================================
 
 class MessageRequest(BaseModel):
     text: str
 
-@app.post("/predict")
-def predict_threat(req: MessageRequest):
-    text = req.text
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Xabar bo'sh bo'lishi mumkin emas.")
-
-    tokens = tokenize_cyber(text)
-    seq = text_to_sequence(text, vocab)
-    seq_tensor = torch.tensor([seq], dtype=torch.long).to(DEVICE)
-
-    with torch.no_grad():
-        logits, _ = model(seq_tensor)
-        ml_prob = torch.sigmoid(logits / 1.8).item()
-
-    lower_t = text.lower()
-
-    # Domen tahlili
-    raw_urls = re.findall(r'(?:https?:\/\/)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', text)
-    has_untrusted_url = any(
-        not any(dom.lower().replace('www.', '') == td or dom.lower().replace('www.', '').endswith('.' + td) for td in TRUSTED_DOMAINS)
-        for dom in raw_urls
-    )
-
-    # Hujum belgilari
-    has_apk = '<apk>' in tokens or '.apk' in lower_t
-    has_card = bool(re.search(r'\b(8600|9860|5614|6262)[\d\s\*]{8,22}', text))
-    urgency = ['kasal', 'shifoxona', 'bloklandi', 'tashlab tur', 'avariya', 'operatsiya', 'qarz', 'yordam ber', 'iib']
-    has_social_eng = (has_card or 'karta' in lower_t) and any(w in lower_t for w in urgency)
-    lures = ['yutdingiz', 'yutuq', 'sovrin', 'depozit bonusi', 'pul yutib', 'bepul tarqatilmoqda', 'kredit tasdiqlandi']
-    has_lure = any(w in lower_t for w in lures)
-
-    is_offensive = has_apk or has_social_eng or (has_untrusted_url and (has_lure or 'kod' in lower_t or 'kirish' in lower_t))
-
-    # Rasmiy / Logistika belgilari (False Positive oldini oluvchi)
-    defensive_phrases = [
-        "hech kimga aytmang", "hech kimga bermang", "hech kim bilan bo'lishmang",
-        "agar so'ramagan bo'lsangiz", "e'tibor bermang", "kredit to'lovi",
-        "to'lashingiz kerak", "amal qilish muddati", "hisobingiz to'ldirildi",
-        "kuryerga topshirildi", "yetkaziladi", "oralig'ida yetkaziladi",
-        "buyurtmangiz", "kuryer:", "punktga yetib keldi"
-    ]
-    is_defensive = any(p in lower_t for p in defensive_phrases)
-
-    if is_offensive:
-        final_prob = max(ml_prob, 0.985)
-        decision = "ANIQ KIBER-TAHDID"
-    elif is_defensive and not has_untrusted_url and not has_card:
-        final_prob = min(ml_prob, 0.035)
-        decision = "RASMIY XIZMAT / LOGISTIKA"
-    else:
-        final_prob = ml_prob
-        decision = "NEYRON TARMOQ TAHLILI"
-
-    is_spam = final_prob >= 0.5
-    return {
-        "text": text,
-        "is_threat": is_spam,
-        "threat_probability": round(final_prob * 100, 2),
-        "status": "XAVFLI (SPAM / FISHING)" if is_spam else "XAVFSIZ (RASMIY / ODDIY)",
-        "decision_basis": decision
-    }
+class FeedbackRequest(BaseModel):
+    text_hash: str
+    user_reaction: str  # 'correct' yoki 'incorrect'
 
 @app.get("/")
-def root():
-    return {"status": "running", "model_version": "v2_balanced"}
+def home():
+    return {
+        "status": "online",
+        "service": "Uzbek Cyber Threat & SOC Classifier v3.0",
+        "vault_connected": True
+    }
+
+@app.post("/predict")
+async def predict_message(req: MessageRequest):
+    raw_text = req.text.strip()
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="Bo'sh matn kiritildi.")
+
+    # 1. SHA-256 Hesh va Shaxsiy ma'lumotlarni niqoblash
+    text_hash = calculate_text_hash(raw_text)
+    clean_text = mask_personal_data(raw_text)
+    card_type, domain, has_apk = extract_threat_iocs(raw_text)
+
+    # 2. Xavf ehtimolini baholash (Model + Gibrid Kiber-Filtr)
+    prob = 15.0  # Standart xavfsiz boshlang'ich
+    basis = "Statik Evristik Qoidalar"
+
+    if model and vocab:
+        words = re.findall(r'\b\w+\b', raw_text.lower())
+        seq = [vocab.get(w, 1) for w in words][:MAX_LEN]
+        if len(seq) < MAX_LEN:
+            seq += [0] * (MAX_LEN - len(seq))
+        
+        tensor_in = torch.tensor([seq], dtype=torch.long).to(device)
+        with torch.no_grad():
+            out = model(tensor_in).item()
+            prob = round(out * 100, 1)
+            basis = "Bi-LSTM Neyron Modeli"
+    else:
+        # Model fayli bo'lmaganda zaxira filtr
+        if has_apk or (card_type and "http" in raw_text.lower()):
+            prob = 92.0
+            basis = "Evristik Kiber-Qoidalar (Zararli IoC)"
+        elif "ovoz" in raw_text.lower() and "http" in raw_text.lower():
+            prob = 88.0
+            basis = "Telegram Fishing Qoidasi"
+
+    # 3. Supabase bazasiga orqa fonda xavfsiz saqlash
+    # (Foydalanuvchini kutib o'tirmasligi uchun tezkor yoziladi)
+    await save_or_increment_in_vault(clean_text, text_hash, prob, card_type, domain, has_apk)
+
+    return {
+        "threat_probability": prob,
+        "is_threat": prob >= 50.0,
+        "text_hash": text_hash,
+        "decision_basis": basis,
+        "detected_iocs": {
+            "card": card_type,
+            "domain": domain,
+            "has_apk": has_apk
+        }
+    }
+
+@app.post("/feedback")
+async def submit_feedback(req: FeedbackRequest):
+    """Foydalanuvchi fikriga asosan xabarni 5 ta savatga saralash"""
+    reaction = req.user_reaction.lower()
+    if reaction not in ["correct", "incorrect"]:
+        raise HTTPException(status_code=400, detail="Noto'g'ri reaksiya turi.")
+
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            # Hesh orqali xabarni qidiramiz
+            url = f"{SUPABASE_URL}/rest/v1/threat_vault?text_hash=eq.{req.text_hash}&select=id,model_prob"
+            resp = await client.get(url, headers=SUPABASE_HEADERS)
+            
+            if resp.status_code == 200 and resp.json():
+                row = resp.json()[0]
+                row_id = row["id"]
+                prob = row.get("model_prob", 50.0)
+
+                # =========================================================
+                # 5 TA SAVATGA SARALASH MANTIQI
+                # =========================================================
+                basket = "general_feedback"
+                
+                if reaction == "incorrect":
+                    if prob >= 80.0 or prob <= 20.0:
+                        basket = "quarantine_dispute"              # 1-savat: Zidlik / Karantin
+                    elif 35.0 < prob < 65.0:
+                        basket = "active_learning_uncertain_err"   # 2-savat: Oltin namuna (Ikkilanishdagi xato)
+                    else:
+                        basket = "borderline_disputed"
+                elif reaction == "correct":
+                    if prob >= 80.0 or prob <= 20.0:
+                        basket = "verified_ground_truth"           # 3-savat: 100% tasdiqlangan bilim
+                    elif 35.0 < prob < 65.0:
+                        basket = "uncertain_confirmed"             # 4-savat: Ikkilanishdagi tasdiq
+                    else:
+                        basket = "general_confirmed"
+
+                # Bazadagi qatorni yangilaymiz
+                patch_url = f"{SUPABASE_URL}/rest/v1/threat_vault?id=eq.{row_id}"
+                await client.patch(
+                    patch_url, 
+                    headers=SUPABASE_HEADERS, 
+                    json={
+                        "user_reaction": reaction,
+                        "basket_type": basket
+                    }
+                )
+                return {"status": "success", "assigned_basket": basket}
+            else:
+                raise HTTPException(status_code=404, detail="Xabar bazadan topilmadi.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
