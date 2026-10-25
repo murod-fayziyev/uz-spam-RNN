@@ -15,6 +15,7 @@ from typing import Optional
 # =====================================================================
 SUPABASE_URL = "https://hmmdrxeotfjscwudsyhb.supabase.co"
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -24,8 +25,8 @@ SUPABASE_HEADERS = {
 
 app = FastAPI(
     title="Uzbek Cyber Threat & SOC Intelligence API",
-    version="3.0",
-    description="Bi-LSTM Attention Engine + Supabase Threat Vault Integratsiyasi"
+    version="3.1",
+    description="Bi-LSTM Attention Engine + Supabase Threat Vault (Dual Counter)"
 )
 
 # CORS sozlamalari (GitHub Pages ruxsati)
@@ -46,10 +47,9 @@ class Attention(nn.Module):
         self.attn = nn.Linear(hidden_dim * 2, 1)
 
     def forward(self, lstm_output):
-        # lstm_output: (batch_size, seq_len, hidden_dim * 2)
-        scores = self.attn(lstm_output).squeeze(2)  # (batch_size, seq_len)
-        weights = torch.softmax(scores, dim=1).unsqueeze(2)  # (batch_size, seq_len, 1)
-        context = torch.sum(lstm_output * weights, dim=1)  # (batch_size, hidden_dim * 2)
+        scores = self.attn(lstm_output).squeeze(2)
+        weights = torch.softmax(scores, dim=1).unsqueeze(2)
+        context = torch.sum(lstm_output * weights, dim=1)
         return context
 
 class BiLSTMClassifier(nn.Module):
@@ -111,13 +111,11 @@ load_ai_engine()
 
 def mask_personal_data(text: str) -> str:
     """Karta va telefon kabi shaxsiy ma'lumotlarni qisman yopish"""
-    # Karta raqamlarini niqoblash: 8600 1234 5678 9012 -> 8600 12** **** 9012
     masked = re.sub(
         r'\b(8600|9860|5614|6262)[\s\-]?(\d{2})\d{2}[\s\-]?\d{4}[\s\-]?(\d{4})\b',
         r'\1 \2** **** \3',
         text
     )
-    # Telefon raqamlarini niqoblash: +998 90 123 45 67 -> +998 90 *** ** 67
     masked = re.sub(
         r'(\+?998[\s\-]?[0-9]{2})[\s\-]?[0-9]{3}[\s\-]?[0-9]{2}([\s\-]?[0-9]{2})',
         r'\1 *** ** \2',
@@ -129,7 +127,6 @@ def extract_threat_iocs(text: str):
     """Matndan texnik IoC parametrlarini ajratib olish"""
     lower = text.lower()
     
-    # 1. Karta turi
     card_type = None
     if re.search(r'\b8600', text):
         card_type = "Uzcard (8600)"
@@ -138,14 +135,12 @@ def extract_threat_iocs(text: str):
     elif re.search(r'\b(5614|6262)', text):
         card_type = "Xalqaro / Boshqa Karta"
 
-    # 2. Domen va domen zonasi
     domain_info = None
     url_match = re.search(r'https?://([^/\s]+)|www\.([^/\s]+)|\b([a-zA-Z0-9\.\-]+\.(?:top|xyz|link|site|biz|ru|com|uz|info|online))\b', text, re.I)
     if url_match:
         extracted = url_match.group(1) or url_match.group(2) or url_match.group(3)
         domain_info = extracted.lower()
 
-    # 3. APK borligi
     has_apk = bool(".apk" in lower)
 
     return card_type, domain_info, has_apk
@@ -160,15 +155,13 @@ def calculate_text_hash(text: str) -> str:
 # =====================================================================
 
 async def save_or_increment_in_vault(clean_text: str, text_hash: str, prob: float, card_type: str, domain: str, has_apk: bool):
-    """Xabarni Supabase bazasiga kiritish yoki takrorlanish sonini oshirish"""
+    """Xabarni bazaga kiritish yoki kelishlar sonini (+1) oshirish"""
     try:
         async with httpx.AsyncClient(timeout=4.0) as client:
-            # 1. Hesh orqali bazada bor-yo'qligini tekshirish
             check_url = f"{SUPABASE_URL}/rest/v1/threat_vault?text_hash=eq.{text_hash}&select=id,occurrence_count"
             resp = await client.get(check_url, headers=SUPABASE_HEADERS)
             
             if resp.status_code == 200 and resp.json():
-                # Xabar allaqachon bor: occurrence_count ni +1 ga oshiramiz
                 row = resp.json()[0]
                 row_id = row["id"]
                 current_count = row.get("occurrence_count", 1) or 1
@@ -176,7 +169,6 @@ async def save_or_increment_in_vault(clean_text: str, text_hash: str, prob: floa
                 patch_url = f"{SUPABASE_URL}/rest/v1/threat_vault?id=eq.{row_id}"
                 await client.patch(patch_url, headers=SUPABASE_HEADERS, json={"occurrence_count": current_count + 1})
             else:
-                # Yangi xabar: 5-savat (inference_raw_logs) qilib yozamiz
                 insert_url = f"{SUPABASE_URL}/rest/v1/threat_vault"
                 payload = {
                     "text_hash": text_hash,
@@ -187,11 +179,13 @@ async def save_or_increment_in_vault(clean_text: str, text_hash: str, prob: floa
                     "ioc_card": card_type,
                     "ioc_domain": domain,
                     "ioc_has_apk": has_apk,
-                    "occurrence_count": 1
+                    "occurrence_count": 1,
+                    "correct_count": 0,
+                    "incorrect_count": 0
                 }
                 await client.post(insert_url, headers=SUPABASE_HEADERS, json=payload)
     except Exception as e:
-        print(f" [SUPABASE XATOLIGI] Yozishda muammo: {e}")
+        print(f" [SUPABASE XATOLIGI] Saqlashda muammo: {e}")
 
 # =====================================================================
 # 6. API ENDPOINTLARI
@@ -208,7 +202,7 @@ class FeedbackRequest(BaseModel):
 def home():
     return {
         "status": "online",
-        "service": "Uzbek Cyber Threat & SOC Classifier v3.0",
+        "service": "Uzbek Cyber Threat & SOC Classifier v3.1",
         "vault_connected": True
     }
 
@@ -218,13 +212,11 @@ async def predict_message(req: MessageRequest):
     if not raw_text:
         raise HTTPException(status_code=400, detail="Bo'sh matn kiritildi.")
 
-    # 1. SHA-256 Hesh va Shaxsiy ma'lumotlarni niqoblash
     text_hash = calculate_text_hash(raw_text)
     clean_text = mask_personal_data(raw_text)
     card_type, domain, has_apk = extract_threat_iocs(raw_text)
 
-    # 2. Xavf ehtimolini baholash (Model + Gibrid Kiber-Filtr)
-    prob = 15.0  # Standart xavfsiz boshlang'ich
+    prob = 15.0
     basis = "Statik Evristik Qoidalar"
 
     if model and vocab:
@@ -239,7 +231,6 @@ async def predict_message(req: MessageRequest):
             prob = round(out * 100, 1)
             basis = "Bi-LSTM Neyron Modeli"
     else:
-        # Model fayli bo'lmaganda zaxira filtr
         if has_apk or (card_type and "http" in raw_text.lower()):
             prob = 92.0
             basis = "Evristik Kiber-Qoidalar (Zararli IoC)"
@@ -247,8 +238,7 @@ async def predict_message(req: MessageRequest):
             prob = 88.0
             basis = "Telegram Fishing Qoidasi"
 
-    # 3. Supabase bazasiga orqa fonda xavfsiz saqlash
-    # (Foydalanuvchini kutib o'tirmasligi uchun tezkor yoziladi)
+    # Bazaga yozish
     await save_or_increment_in_vault(clean_text, text_hash, prob, card_type, domain, has_apk)
 
     return {
@@ -265,53 +255,63 @@ async def predict_message(req: MessageRequest):
 
 @app.post("/feedback")
 async def submit_feedback(req: FeedbackRequest):
-    """Foydalanuvchi fikriga asosan xabarni 5 ta savatga saralash"""
+    """Foydalanuvchi ovozini alohida hisoblagichlarga qo'shish va savatni belgilash"""
     reaction = req.user_reaction.lower()
     if reaction not in ["correct", "incorrect"]:
         raise HTTPException(status_code=400, detail="Noto'g'ri reaksiya turi.")
 
     try:
         async with httpx.AsyncClient(timeout=4.0) as client:
-            # Hesh orqali xabarni qidiramiz
-            url = f"{SUPABASE_URL}/rest/v1/threat_vault?text_hash=eq.{req.text_hash}&select=id,model_prob"
+            url = f"{SUPABASE_URL}/rest/v1/threat_vault?text_hash=eq.{req.text_hash}&select=id,model_prob,correct_count,incorrect_count"
             resp = await client.get(url, headers=SUPABASE_HEADERS)
             
             if resp.status_code == 200 and resp.json():
                 row = resp.json()[0]
                 row_id = row["id"]
                 prob = row.get("model_prob", 50.0)
-
-                # =========================================================
-                # 5 TA SAVATGA SARALASH MANTIQI
-                # =========================================================
-                basket = "general_feedback"
                 
-                if reaction == "incorrect":
-                    if prob >= 80.0 or prob <= 20.0:
-                        basket = "quarantine_dispute"              # 1-savat: Zidlik / Karantin
-                    elif 35.0 < prob < 65.0:
-                        basket = "active_learning_uncertain_err"   # 2-savat: Oltin namuna (Ikkilanishdagi xato)
-                    else:
-                        basket = "borderline_disputed"
-                elif reaction == "correct":
-                    if prob >= 80.0 or prob <= 20.0:
-                        basket = "verified_ground_truth"           # 3-savat: 100% tasdiqlangan bilim
-                    elif 35.0 < prob < 65.0:
-                        basket = "uncertain_confirmed"             # 4-savat: Ikkilanishdagi tasdiq
-                    else:
-                        basket = "general_confirmed"
+                # Mavjud hisoblagichlarni olish
+                correct_c = row.get("correct_count") or 0
+                incorrect_c = row.get("incorrect_count") or 0
 
-                # Bazadagi qatorni yangilaymiz
+                # Reaksiyaga qarab mos hisoblagichni oshirish
+                if reaction == "correct":
+                    correct_c += 1
+                else:
+                    incorrect_c += 1
+
+                # Umumiy ovozlar konsensusi asosida savatni aniqlash
+                if incorrect_c > correct_c:
+                    if prob >= 80.0 or prob <= 20.0:
+                        basket = "quarantine_dispute"              # 1-savat: Karantin (Ziddiyat)
+                    else:
+                        basket = "active_learning_uncertain_err"   # 2-savat: Oltin namuna
+                elif correct_c >= incorrect_c and correct_c > 0:
+                    if prob >= 80.0 or prob <= 20.0:
+                        basket = "verified_ground_truth"           # 3-savat: Tasdiqlangan bilim
+                    else:
+                        basket = "uncertain_confirmed"             # 4-savat: Ikkilanishdagi tasdiq
+                else:
+                    basket = "inference_raw_logs"
+
+                # Bazadagi hisoblagichlar va savatni yangilash
                 patch_url = f"{SUPABASE_URL}/rest/v1/threat_vault?id=eq.{row_id}"
                 await client.patch(
                     patch_url, 
                     headers=SUPABASE_HEADERS, 
                     json={
                         "user_reaction": reaction,
+                        "correct_count": correct_c,
+                        "incorrect_count": incorrect_c,
                         "basket_type": basket
                     }
                 )
-                return {"status": "success", "assigned_basket": basket}
+                return {
+                    "status": "success", 
+                    "assigned_basket": basket,
+                    "correct_count": correct_c,
+                    "incorrect_count": incorrect_c
+                }
             else:
                 raise HTTPException(status_code=404, detail="Xabar bazadan topilmadi.")
     except Exception as e:
