@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 # Render > Environment: SUPABASE_SERVICE_KEY (service_role kaliti!), VOTER_SALT (tasodifiy uzun matn)
 SB_URL = os.getenv("SUPABASE_URL", "https://hmmdrxeotfjscwudsyhb.supabase.co")
-SB_KEY = os.getenv("SUPABASE_KEY", "")
+SB_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 SALT = os.getenv("VOTER_SALT", "change-me")
 HDR = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}", "Content-Type": "application/json"}
 MAX_TEXT, MAX_LEN = 1500, 100
