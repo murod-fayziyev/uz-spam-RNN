@@ -11,46 +11,57 @@ SALT = os.getenv("VOTER_SALT", "change-me")
 HDR = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}", "Content-Type": "application/json"}
 MAX_TEXT, MAX_LEN = 1500, 100
 
-app = FastAPI(title="Uzbek Scam Checker", version="5.0")
+app = FastAPI(title="Uzbek Scam Checker", version="5.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
                    allow_methods=["*"], allow_headers=["*"])
 
-# ---------------- Model (o'zgarmagan) ----------------
+# ---------------- Model (best_model.pth dagi haqiqiy arxitektura) ----------------
 class Attention(nn.Module):
-    def __init__(self, h):
-        super().__init__(); self.attn = nn.Linear(h * 2, 1)
+    def __init__(self, dim):
+        super().__init__()
+        self.projection = nn.Sequential(nn.Linear(dim, 64), nn.Tanh(), nn.Linear(64, 1))
     def forward(self, x):
-        w = torch.softmax(self.attn(x).squeeze(2), dim=1).unsqueeze(2)
+        w = torch.softmax(self.projection(x), dim=1)
         return torch.sum(x * w, dim=1)
 
 class BiLSTMClassifier(nn.Module):
-    def __init__(self, vocab_size, embed_dim=64, hidden_dim=64, num_layers=1):
+    def __init__(self, vocab_size):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers=num_layers, batch_first=True, bidirectional=True)
-        self.attention = Attention(hidden_dim)
-        self.fc = nn.Linear(hidden_dim * 2, 1)
+        self.embedding = nn.Embedding(vocab_size, 128, padding_idx=0)
+        self.lstm = nn.LSTM(128, 128, num_layers=2, batch_first=True, bidirectional=True, dropout=0.3)
+        self.attention = Attention(256)
+        self.fc = nn.Sequential(nn.Linear(256, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, 1))
     def forward(self, x):
         out, _ = self.lstm(self.embedding(x))
         return torch.sigmoid(self.fc(self.attention(out)))
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = vocab = None
+MODEL_ERR = None
 try:
     with open("vocab_pro.pkl", "rb") as f:
         vocab = pickle.load(f)
-    path = "best_spam_bilstm_pro.pt" if os.path.exists("best_spam_bilstm_pro.pt") else "best_model.pth"
-    model = BiLSTMClassifier(len(vocab))
-    model.load_state_dict(torch.load(path, map_location=device))
-    model.to(device).eval()
+    m = BiLSTMClassifier(len(vocab))
+    m.load_state_dict(torch.load("best_model.pth", map_location=device))
+    model = m.to(device).eval()      # faqat muvaffaqiyatli yuklansa model deb belgilanadi
 except Exception as e:
+    MODEL_ERR = str(e)[:300]
     print("Model yuklanmadi:", e)
 
+def prep(text):
+    """O'qitishdagi kabi: lug'atda <url>, <card>, <apk>, <phone>, <num> belgilari va apostrofli so'zlar bor."""
+    t = re.sub(r"[ʻʼ’`‘]", "'", text.lower())
+    t = re.sub(r"https?://\S+|www\.\S+|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:%s)\b\S*" % TLDS, " <url> ", t)
+    t = re.sub(r"\S*\.apk\b", " <apk> ", t)
+    t = re.sub(r"\b(?:\d{4}[\s\-]?){3}\d{4}\b", " <card> ", t)
+    t = re.sub(r"\+?998[\s\-]?\d{2}[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}", " <phone> ", t)
+    t = re.sub(r"\b\d+\b", " <num> ", t)
+    return re.findall(r"<[a-z]+>|[a-z0-9_']+", t)
+
 def ml_score(text):
-    if not (model and vocab):
-        return 15.0
-    ids = [vocab.get(w, 1) for w in re.findall(r"\b\w+\b", text.lower())][:MAX_LEN]
-    ids += [0] * (MAX_LEN - len(ids))
+    if model is None:
+        return None
+    ids = [vocab.get(w, 1) for w in prep(text)][:MAX_LEN] or [1]
     with torch.no_grad():
         return round(model(torch.tensor([ids]).to(device)).item() * 100, 1)
 
@@ -149,7 +160,7 @@ class Vote(BaseModel):
 
 @app.get("/")
 def home():
-    return {"status": "online", "version": "5.0", "model_loaded": model is not None, "vault": bool(SB_KEY)}
+    return {"status": "online", "version": "5.1", "model_loaded": model is not None, "model_error": MODEL_ERR, "vault": bool(SB_KEY)}
 
 @app.post("/predict")
 async def predict(req: MessageRequest, bg: BackgroundTasks):
@@ -161,6 +172,8 @@ async def predict(req: MessageRequest, bg: BackgroundTasks):
         raise HTTPException(422, err)
     S, domain, card_type, official = analyze(text)
     ml = ml_score(text)
+    if ml is None:
+        ml = 0.0
     rule = min(98, sum(s[0] for s in S))
     final = min(ml, 10.0) if official else max(ml, float(rule))
     verdict = "xavfli" if final >= 70 else "shubhali" if final >= 30 else "xavfsiz"
